@@ -1,0 +1,6 @@
+fastcore
+python-fasthtml
+uvicorn
+requests
+Pillow
+python-dotenv
