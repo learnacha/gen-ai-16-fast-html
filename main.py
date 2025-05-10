@@ -1,175 +1,197 @@
-from fastcore.parallel import threaded
-from fasthtml.common import *
-import uuid, os, uvicorn
-from PIL import Image # PIL is used by InferenceClient result and for saving
-# import io # No longer needed for BytesIO
-# import requests # No longer needed
+from fastapi import FastAPI, Request, Form, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+import sqlite3
+import uuid
+import os
+import uvicorn
+from PIL import Image
 from dotenv import load_dotenv
-from huggingface_hub import InferenceClient # Import the InferenceClient
+from huggingface_hub import InferenceClient
+from typing import List, Optional
+from threading import Thread
 
 # Load environment variables from .env file
 load_dotenv()
 API_KEY = os.getenv("HUGGINGFACE_API_KEY") + "y"
-# API_URL = "https://api-inference.huggingface.co/models/alvdansen/littletinies" # Old API URL - Removed
-# headers = {"Authorization": f"Bearer {API_KEY}"} # Old headers - Removed
 
-# --- New: Initialize the InferenceClient ---
-if not API_KEY:
-    print("Error: Hugging Face API token not found! Please set HUGGINGFACE_API_KEY in your .env file.")
-    # You might want to exit or handle this more gracefully depending on your needs
-    # For now, we'll let it proceed, but generation will fail.
-    client = None
-else:
-    try:
-        client = InferenceClient(token=API_KEY)
-        print("Hugging Face InferenceClient initialized successfully.")
-    except Exception as e:
-        print(f"Error initializing Huggin Face InferenceClient: {e}")
-        client = None
-# --- End New ---
+# Initialize the InferenceClient with your API key
+client = InferenceClient(token=API_KEY) if API_KEY else None
 
-# --- Removed old query function ---
-# def query(payload):
-#     response = requests.post(API_URL, headers=headers, json=payload)
-#     return response.content
-# --- End Removed ---
+# Ensure directories exist
+os.makedirs("data", exist_ok=True)
+os.makedirs("data/gens", exist_ok=True)
+os.makedirs("templates", exist_ok=True)
+os.makedirs("static", exist_ok=True)
 
-# gens database for storing generated image details
-tables = database('data/gens.db').t
-gens = tables.gens
-if not gens in tables:
-    gens.create(prompt=str, id=int, folder=str, pk='id')
-Generation = gens.dataclass()
+# Create database connection
+conn = sqlite3.connect('data/gens.db')
+cursor = conn.cursor()
 
-# Flexbox CSS (http://flexboxgrid.com/)
-gridlink = Link(rel="stylesheet", href="https://cdnjs.cloudflare.com/ajax/libs/flexboxgrid/6.3.1/flexboxgrid.min.css", type="text/css")
+# Create table if it doesn't exist
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS gens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prompt TEXT NOT NULL,
+    folder TEXT NOT NULL
+)
+''')
+conn.commit()
 
-# Our FastHTML app
-app = FastHTML(hdrs=(picolink, gridlink))
+# Create FastAPI app
+app = FastAPI()
 
-# Main page
-@app.get("/")
-def home():
-    inp = Input(id="new-prompt", name="prompt", placeholder="Enter a prompt")
-    # Add a check for the API key status
-    if not API_KEY or client is None:
-        add_section = Div(
-            P("⚠️ Hugging Face API Key not configured correctly. Please set HUGGINGFACE_API_KEY in your .env file.", style="color: red;"),
-            Form(Group(inp, Button("Generate", disabled=True))) # Disable button if no key/client
-        )
+# Templates directory for HTML templates
+templates = Jinja2Templates(directory="templates")
+
+# Serve static files and generated images
+app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/data", StaticFiles(directory="data"), name="data")
+
+# Create HTML template file
+with open("templates/index.html", "w") as f:
+    f.write('''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Image Generation Demo</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@1/css/pico.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/flexboxgrid/6.3.1/flexboxgrid.min.css">
+    <script src="https://unpkg.com/htmx.org@1.9.6"></script>
+    <style>
+        .card { margin-bottom: 1rem; }
+        .card img { width: 100%; height: auto; }
+    </style>
+</head>
+<body>
+    <main class="container">
+        <h1>Magic Image Generation</h1>
+        
+        <form hx-post="/generate" hx-target="#gen-list" hx-swap="afterbegin">
+            <div class="grid">
+                <input id="new-prompt" name="prompt" placeholder="Enter a prompt" required>
+                <button type="submit">Generate</button>
+            </div>
+        </form>
+        
+        <div id="gen-list" class="row">
+            {% for gen in generations %}
+            <div id="gen-{{ gen.id }}" class="box col-xs-12 col-sm-6 col-md-4 col-lg-3">
+                {% if gen.image_exists %}
+                <div class="card">
+                    <img src="/data/gens/{{ gen.folder_name }}/{{ gen.id }}.png" alt="Generated image" class="card-img-top">
+                    <div class="card-body">
+                        <p class="card-text"><b>Prompt: </b>{{ gen.prompt }}</p>
+                    </div>
+                </div>
+                {% else %}
+                <div hx-get="/gens/{{ gen.id }}" hx-trigger="every 2s" hx-swap="outerHTML">
+                    Generating gen {{ gen.id }} with prompt {{ gen.prompt }}
+                </div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+    </main>
+</body>
+</html>
+''')
+
+# Models
+class Generation(BaseModel):
+    id: int
+    prompt: str
+    folder: str
+    image_exists: bool = False
+    folder_name: str = ""
+    
+# Routes
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    # Get recent generations from the database
+    cursor.execute("SELECT id, prompt, folder FROM gens ORDER BY id DESC LIMIT 10")
+    rows = cursor.fetchall()
+    
+    generations = []
+    for row in rows:
+        gen_id, prompt, folder = row
+        folder_name = os.path.basename(folder)
+        image_path = f"{folder}/{gen_id}.png"
+        image_exists = os.path.exists(image_path)
+        
+        generations.append({
+            "id": gen_id,
+            "prompt": prompt,
+            "folder": folder,
+            "folder_name": folder_name,
+            "image_exists": image_exists
+        })
+    
+    return templates.TemplateResponse("index.html", {"request": request, "generations": generations})
+
+@app.get("/gens/{gen_id}")
+async def get_generation(gen_id: int, request: Request):
+    # Get generation from database
+    cursor.execute("SELECT id, prompt, folder FROM gens WHERE id = ?", (gen_id,))
+    row = cursor.fetchone()
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="Generation not found")
+    
+    gen_id, prompt, folder = row
+    folder_name = os.path.basename(folder)
+    image_path = f"{folder}/{gen_id}.png"
+    image_exists = os.path.exists(image_path)
+    
+    # If image exists, return HTML with image
+    if image_exists:
+        return f'''
+        <div id="gen-{gen_id}" class="box col-xs-12 col-sm-6 col-md-4 col-lg-3">
+            <div class="card">
+                <img src="/data/gens/{folder_name}/{gen_id}.png" alt="Generated image" class="card-img-top">
+                <div class="card-body">
+                    <p class="card-text"><b>Prompt: </b>{prompt}</p>
+                </div>
+            </div>
+        </div>
+        '''
     else:
-         add_section = Form(Group(inp, Button("Generate")), hx_post="/", target_id='gen-list', hx_swap="afterbegin")
+        # Otherwise, return HTML that will continue polling
+        return f'''
+        <div id="gen-{gen_id}" class="box col-xs-12 col-sm-6 col-md-4 col-lg-3" hx-get="/gens/{gen_id}" hx-trigger="every 2s" hx-swap="outerHTML">
+            Generating gen {gen_id} with prompt {prompt}
+        </div>
+        '''
 
-    # Fetch existing generations
-    try:
-        gen_records = gens(limit=10)
-    except Exception as e:
-        print(f"Database error fetching generations: {e}") # Log DB errors
-        gen_records = []
-
-    gen_containers = [generation_preview(g) for g in gen_records] # Start with last 10
-    gen_list = Div(*reversed(gen_containers), id='gen-list', cls="row") # flexbox container: class = row
-    return Title('Image Generation Demo'), Main(H1('Magic Image Generation'), add_section, gen_list, cls='container')
-
-# Show the image (if available) and prompt for a generation
-def generation_preview(g):
-    grid_cls = "box col-xs-12 col-sm-6 col-md-4 col-lg-3"
-    image_path = f"{g.folder}/{g.id}.png"
-    image_preview_content = []
-
-    if os.path.exists(image_path):
-        # Check if the image file is valid (e.g., not 0 bytes)
-        try:
-            if os.path.getsize(image_path) > 0:
-                 # Attempt to open to ensure it's a valid image file
-                 with Image.open(image_path) as img:
-                     img.verify() # Verify closes the file
-                 image_preview_content.append(Img(src=image_path, alt="Generated image", cls="card-img-top"))
-            else:
-                print(f"Warning: Image file is empty for gen {g.id} at {image_path}")
-                image_preview_content.append(P("⚠️ Error: Image file is empty.", cls="card-text", style="color: orange;"))
-        except (FileNotFoundError, OSError, Image.UnidentifiedImageError, ValueError) as e:
-             print(f"Error loading/verifying image for gen {g.id} at {image_path}: {e}")
-             image_preview_content.append(P(f"⚠️ Error loading image: {e}", cls="card-text", style="color: orange;"))
-
-        image_preview_content.append(Div(P(B("Prompt: "), g.prompt, cls="card-text"), cls="card-body"))
-        # Card structure for existing image
-        return Div(Card(*image_preview_content), id=f'gen-{g.id}', cls=grid_cls)
-    else:
-        # Structure for pending generation (polling)
-        return Div(
-            Card(
-                Div(
-                    P(f"⏳ Generating image for prompt:", cls="card-text"),
-                    P(B(g.prompt), cls="card-text"),
-                    # Optional: Add a spinner or loading indicator here
-                    # E.g., Img(src="/static/spinner.gif", alt="Loading...")
-                    cls="card-body"
-                )
-            ),
-            id=f'gen-{g.id}', hx_get=f"/gens/{g.id}",
-            hx_trigger="every 3s", hx_swap="outerHTML", # Increased polling interval slightly
-            cls=grid_cls
-        )
-
-
-# A pending preview keeps polling this route until we return the image preview
-@app.get("/gens/{id}")
-def preview(id:int):
-    try:
-        g = gens.get(id)
-        return generation_preview(g)
-    except Exception as e:
-        # Handle case where generation ID might not exist (e.g., DB issue)
-        print(f"Error fetching generation {id} for preview: {e}")
-        # Return an error message placeholder
-        return Div(P(f"Error finding generation {id}.", style="color: red;"), id=f'gen-{id}', cls="box col-xs-12 col-sm-6 col-md-4 col-lg-3")
-
-# For images, CSS, etc.
-@app.get("/{fname:path}.{ext:static}")
-def static(fname:str, ext:str):
-    file_path = f'{fname}.{ext}'
-    # Basic security check: Ensure the path doesn't try to escape the intended directory
-    # This is a very basic check, consider more robust validation if needed.
-    if ".." in file_path or not os.path.exists(file_path) or not os.path.isfile(file_path):
-        # Return a 404 Not Found response if the file doesn't exist or path is suspicious
-        # This requires returning an appropriate HTTP response, which FileResponse doesn't directly handle
-        # For simplicity here, we might just log and let it potentially fail,
-        # but a real app should return a proper 404 status code.
-        print(f"Static file access denied or file not found: {file_path}")
-        # Placeholder: Return an empty response or raise an HTTP exception if using a framework that supports it easily
-        return P("") # Or handle as appropriate for FastHTML/Starlette error handling
-
-    # Check if the requested path is within an allowed directory (e.g., 'data/gens' or a dedicated 'static' folder)
-    # Example: Allow access only within 'data/gens'
-    allowed_base = os.path.abspath("data/gens")
-    requested_path_abs = os.path.abspath(file_path)
-    if not requested_path_abs.startswith(allowed_base):
-         print(f"Static file access denied (outside allowed directory): {file_path}")
-         return P("") # Or handle as appropriate
-
-    return FileResponse(file_path)
-
-
-# Generation route
-@app.post("/")
-def post(prompt:str):
-    # Check again if client is available before proceeding
-    if not client:
-        # This case should ideally be prevented by disabling the button,
-        # but double-check here. You might return an error message component.
-        return P("Error: Image generation service not available.", style="color: red;")
-
-    folder = f"data/gens/{str(uuid.uuid4())}"
+@app.post("/generate")
+async def generate_image(prompt: str = Form(...)):
+    # Create a unique folder for the image
+    folder_name = str(uuid.uuid4())
+    folder = f"data/gens/{folder_name}"
     os.makedirs(folder, exist_ok=True)
-    g = gens.insert(Generation(prompt=prompt, folder=folder))
-    print(f"Created generation record ID {g.id} in folder {g.folder} for prompt: '{prompt}'")
-    generate_and_save(g.prompt, g.id, g.folder) # Call the modified function
-    clear_input = Input(id="new-prompt", name="prompt", placeholder="Enter a prompt", hx_swap_oob='true', value="") # Clear input value
-    return generation_preview(g), clear_input # Return the initial "pending" preview
+    
+    # Insert into database
+    cursor.execute("INSERT INTO gens (prompt, folder) VALUES (?, ?)", (prompt, folder))
+    conn.commit()
+    gen_id = cursor.lastrowid
+    
+    # Start the generation in a separate thread
+    Thread(target=generate_and_save, args=(prompt, gen_id, folder)).start()
+    
+    # Return HTML for pending generation that will poll for updates
+    return f'''
+    <div id="gen-{gen_id}" class="box col-xs-12 col-sm-6 col-md-4 col-lg-3" hx-get="/gens/{gen_id}" hx-trigger="every 2s" hx-swap="outerHTML">
+        Generating gen {gen_id} with prompt {prompt}
+    </div>
+    <script>
+        // Clear input field
+        document.getElementById('new-prompt').value = '';
+    </script>
+    '''
 
-# Generate an image and save it to the folder (in a separate thread)
-@threaded
+# Generate an image and save it to the folder
 def generate_and_save(prompt, id, folder):
     if not client:
         print(f"Skipping generation for ID {id}: InferenceClient not available.")
@@ -180,22 +202,15 @@ def generate_and_save(prompt, id, folder):
         print(f"[{id}] Starting image generation via InferenceClient for prompt: '{prompt}'...")
         image = client.text_to_image(
             prompt,
-            model="black-forest-labs/FLUX.1-dev" # Use the desired model
+            model="black-forest-labs/FLUX.1-dev"  # Use the new model
         )
-        # The result 'image' is already a PIL Image object
+        # Save the image (image is already a PIL Image object)
         image.save(save_path)
         print(f"[{id}] Image generated and saved successfully to {save_path}")
         return True
     except Exception as e:
         print(f"[{id}] Failed to generate or save image for prompt '{prompt}': {e}")
-        # Optionally create an empty file or error placeholder image
-        # Or just leave the file missing, the preview logic will handle it.
-        # Example: Create an empty file to prevent repeated generation attempts if desired
-        # with open(save_path, 'w') as f: pass
         return False
 
-if __name__ == '__main__':
-    # Ensure the base data directory exists
-    os.makedirs("data/gens", exist_ok=True)
-    # Start the server
-    uvicorn.run("main:app", host='0.0.0.0', port=int(os.getenv("PORT", default=8000)))
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", default=8000)))
